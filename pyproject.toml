@@ -1,0 +1,29 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ufrd-updater"
+version = "0.1.0"
+description = "Config-driven artifact updater for the UfRd-Archive project"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = [
+  "beautifulsoup4>=4.12",
+  "httpx>=0.27",
+  "jmespath>=1.0",
+]
+
+[dependency-groups]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+ufrd-updater = "ufrd_updater.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ufrd_updater"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"

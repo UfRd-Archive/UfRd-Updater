@@ -1,0 +1,177 @@
+# UfRd-Updater example configuration.
+#
+# This file is documentation and is accepted by `ufrd-updater validate`.
+# The URLs use example.invalid, so running it would only produce request
+# errors; replace the hosts and selectors with a real source.
+#
+# Target = product, arch = Nix system. A target-level request runs once and
+# feeds every arch; an arch-level request runs once per arch.
+
+version = 1
+
+[settings]
+output_dir = "dist"                  # relative to this file
+concurrency = 4
+retries = 3
+timeout = 30.0
+download_timeout = 120.0
+connect_timeout = 10.0
+user_agent = "ufrd-updater/0.1.0"
+on_error = "fail"                    # fail | continue | rollback
+
+[git]
+commit = true
+push = "auto"                        # auto | true | false
+message = "chore(ufrd): update sources {datetime} ({changed_count} changed; tags: {tags})"
+user_name = "github-actions[bot]"
+user_email = "41898282+github-actions[bot]@users.noreply.github.com"
+
+[release]
+tag_template = "ufrd-{datetime}-{run_id}"
+
+[archive]
+enabled = true
+repository = "UfRd-Archive/UfRd-Archive"
+url_template = "https://github.com/{repository}/releases/download/{tag}/{filename}"
+
+[[target]]
+id = "example-app"
+description = "Example desktop app with API, HTML and redirect sources."
+headers = { Referer = "https://example.invalid/" }
+download_headers = { X-Download-Client = "ufrd-updater" }
+timeout = 30.0
+retries = 3
+tag_template = "ufrd-{id}-{version}"
+vars = { channel = "stable" }
+
+# Shared metadata request. `channel` comes from target vars; `version` is
+# extracted below and then available to later requests and every arch.
+[[target.request]]
+id = "latest"
+url = "https://example.invalid/api/{channel}/latest"
+method = "GET"
+headers = { Accept = "application/json" }
+follow_redirects = true
+expect_status = [200]
+json = { arch = "x86_64", channel = "{channel}" }
+encoding = "utf-8"
+
+# JSON/JMESPath scalar.
+[[target.request.extract]]
+var = "version"
+type = "json"
+query = "release.version"
+
+# JMESPath filter that yields an array, narrowed with index.
+[[target.request.extract]]
+var = "build_id"
+type = "json"
+query = "release.builds[?arch == 'x86_64'].id"
+index = 0
+required = false
+
+# Select one value from an array result.
+[[target.request.extract]]
+var = "first_tag"
+type = "json"
+query = "release.tags"
+index = 0
+required = false
+
+# Regex over a response header, with a capture group.
+[[target.request.extract]]
+var = "etag"
+type = "regex"
+from = "header"
+name = "etag"
+pattern = '"?([0-9a-f]+)"?'
+group = 1
+strip = true
+required = false
+
+# Command extractors run with sh -c. Values arrive through the environment,
+# never by string interpolation into the command.
+[[target.request.extract]]
+var = "release_slug"
+type = "command"
+command = 'printf "%s-%s" "$UFRD_VAR_CHANNEL" "$UFRD_VAR_VERSION"'
+timeout = 10.0
+
+# A second shared request can use variables extracted by the first.
+[[target.request]]
+id = "release-page"
+url = "https://example.invalid/releases/{version}"
+headers = { Accept = "text/html" }
+
+# HTML/CSS extraction.
+[[target.request.extract]]
+var = "download_href"
+type = "html"
+selector = "a.download.primary"
+attr = "href"
+
+# Regex `all` keeps the complete match list.
+[[target.request.extract]]
+var = "all_hrefs"
+type = "regex"
+pattern = 'href="([^"]+)"'
+group = 1
+all = true
+
+# `all` plus `index` selects one item from the full match list.
+[[target.request.extract]]
+var = "last_href"
+type = "regex"
+pattern = 'href="([^"]+)"'
+group = 1
+all = true
+index = -1
+required = false
+
+# Read a variable produced earlier in this request.
+[[target.request.extract]]
+var = "redirect_target"
+type = "regex"
+from = "var"
+source = "download_href"
+pattern = '^https://[^" ]+\.tar\.gz$'
+required = false
+
+# x86_64 Linux: explicit URL and filename templates.
+[[target.arch]]
+id = "x86_64-linux"
+url = "https://example.invalid/files/{version}/example-app-linux-x64.tar.gz"
+filename = "example-app-{version}-linux-x64.tar.gz"
+headers = { X-Arch = "x86_64-linux" }
+download_headers = { X-Download-Arch = "x86_64-linux" }
+vars = { arch_tag = "linux-x64" }
+
+# aarch64 Linux: inspect a redirect from an arch-level request. The URL is
+# filled from the extracted Location header; the redirect is not followed for
+# metadata because expect_status asks for 302.
+[[target.arch]]
+id = "aarch64-linux"
+url = "{redirect_url}"
+filename = "example-app-{version}-linux-aarch64.tar.gz"
+vars = { arch_tag = "linux-aarch64" }
+
+[[target.arch.request]]
+url = "https://example.invalid/redirect/{version}/example-app-linux-aarch64"
+follow_redirects = false
+expect_status = [302]
+headers = { Accept = "*/*" }
+
+[[target.arch.request.extract]]
+var = "redirect_url"
+type = "regex"
+from = "header"
+name = "location"
+pattern = 'https://[^"]+\.tar\.gz'
+
+# Windows artifact. The filename may contain spaces and Unicode, but not
+# slashes or control characters.
+[[target.arch]]
+id = "x86_64-windows"
+url = "https://example.invalid/files/{version}/ExampleAppSetup.exe"
+filename = "ExampleAppSetup-{version}.exe"
+download_headers = { Accept = "application/octet-stream" }

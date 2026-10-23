@@ -1,0 +1,160 @@
+name: UfRd-Updater
+description: Resolve, download and export UfRd artifact sources, then optionally commit and push them.
+author: UfRd-Archive
+
+branding:
+  icon: refresh-cw
+  color: blue
+
+inputs:
+  config:
+    description: Path to updater.toml, relative to the workflow workspace.
+    required: false
+    default: updater.toml
+  only:
+    description: Only run targets whose id matches this regular expression.
+    required: false
+    default: ""
+  force:
+    description: Treat every selected entry as changed ("true" or "false").
+    required: false
+    default: "false"
+  prune:
+    description: Remove manifest/state entries absent from the configuration ("true" or "false").
+    required: false
+    default: "false"
+  on_error:
+    description: Override settings.on_error (fail, continue or rollback).
+    required: false
+    default: ""
+  commit:
+    description: Override git.commit ("true" or "false"). Empty keeps the config value.
+    required: false
+    default: ""
+  push:
+    description: Override git.push ("true" or "false"). Empty keeps the config value; true requires commit.
+    required: false
+    default: ""
+  verbose:
+    description: Enable DEBUG logging ("true" or "false"); URLs remain redacted.
+    required: false
+    default: "false"
+
+outputs:
+  changed:
+    description: "true when at least one entry changed (a release candidate)."
+    value: ${{ steps.ufrd.outputs.changed }}
+  tag:
+    description: The single release tag, or empty when zero or multiple tags.
+    value: ${{ steps.ufrd.outputs.tag }}
+  tags:
+    description: JSON array of release tags.
+    value: ${{ steps.ufrd.outputs.tags }}
+  manifest:
+    description: Absolute path to the generated manifest.json.
+    value: ${{ steps.ufrd.outputs.manifest }}
+  sources:
+    description: Absolute path to the generated sources.nix.
+    value: ${{ steps.ufrd.outputs.sources }}
+  fetchurl:
+    description: Absolute path to the generated fetchurl.nix.
+    value: ${{ steps.ufrd.outputs.fetchurl }}
+  state:
+    description: Absolute path to the generated state.json.
+    value: ${{ steps.ufrd.outputs.state }}
+  releases:
+    description: "Absolute path to this run's releases.json; empty when no batch was exported. Assets include original filename, mapped GitHub asset_name, absolute path and sha256."
+    value: ${{ steps.ufrd.outputs.releases }}
+  urls:
+    description: Absolute path to the generated urls.txt.
+    value: ${{ steps.ufrd.outputs.urls }}
+  summary:
+    description: Absolute path to the generated update.md.
+    value: ${{ steps.ufrd.outputs.summary }}
+  files:
+    description: Newline-separated absolute paths of changed artifact files.
+    value: ${{ steps.ufrd.outputs.files }}
+  failed:
+    description: JSON array of per-entry failures.
+    value: ${{ steps.ufrd.outputs.failed }}
+  failed_count:
+    description: Number of per-entry failures.
+    value: ${{ steps.ufrd.outputs.failed_count }}
+  commit:
+    description: SHA of the created commit, or empty when no commit was made.
+    value: ${{ steps.ufrd.outputs.commit }}
+  pushed:
+    description: "true when the commit was pushed."
+    value: ${{ steps.ufrd.outputs.pushed }}
+
+runs:
+  using: composite
+  steps:
+    - name: Install uv
+      uses: astral-sh/setup-uv@v5
+
+    - name: Run ufrd-updater
+      id: ufrd
+      shell: bash
+      env:
+        UFRD_ACTION_PATH: ${{ github.action_path }}
+        UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/ufrd-updater-venv
+        UFRD_INPUT_CONFIG: ${{ inputs.config }}
+        UFRD_INPUT_ONLY: ${{ inputs.only }}
+        UFRD_INPUT_FORCE: ${{ inputs.force }}
+        UFRD_INPUT_PRUNE: ${{ inputs.prune }}
+        UFRD_INPUT_ON_ERROR: ${{ inputs.on_error }}
+        UFRD_INPUT_COMMIT: ${{ inputs.commit }}
+        UFRD_INPUT_PUSH: ${{ inputs.push }}
+        UFRD_INPUT_VERBOSE: ${{ inputs.verbose }}
+      run: |
+        set -euo pipefail
+
+        if [[ -z "$UFRD_INPUT_CONFIG" ]]; then
+          echo "::error::UfRd-Updater input 'config' must not be empty"
+          exit 2
+        fi
+
+        args=(--config "$UFRD_INPUT_CONFIG")
+
+        if [[ -n "$UFRD_INPUT_ONLY" ]]; then
+          args+=(--only "$UFRD_INPUT_ONLY")
+        fi
+
+        case "$UFRD_INPUT_FORCE" in
+          true) args+=(--force) ;;
+          false|"") ;;
+          *) echo "::error::UfRd-Updater input 'force' must be true or false"; exit 2 ;;
+        esac
+
+        case "$UFRD_INPUT_PRUNE" in
+          true) args+=(--prune) ;;
+          false|"") ;;
+          *) echo "::error::UfRd-Updater input 'prune' must be true or false"; exit 2 ;;
+        esac
+
+        if [[ -n "$UFRD_INPUT_ON_ERROR" ]]; then
+          args+=(--on-error "$UFRD_INPUT_ON_ERROR")
+        fi
+
+        case "$UFRD_INPUT_COMMIT" in
+          true) args+=(--commit) ;;
+          false) args+=(--no-commit) ;;
+          "") ;;
+          *) echo "::error::UfRd-Updater input 'commit' must be true, false or empty"; exit 2 ;;
+        esac
+
+        case "$UFRD_INPUT_PUSH" in
+          true) args+=(--push) ;;
+          false) args+=(--no-push) ;;
+          "") ;;
+          *) echo "::error::UfRd-Updater input 'push' must be true, false or empty"; exit 2 ;;
+        esac
+
+        case "$UFRD_INPUT_VERBOSE" in
+          true) args+=(--verbose) ;;
+          false|"") ;;
+          *) echo "::error::UfRd-Updater input 'verbose' must be true or false"; exit 2 ;;
+        esac
+
+        uv run --project "$UFRD_ACTION_PATH" --frozen ufrd-updater "${args[@]}"

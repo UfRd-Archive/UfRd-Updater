@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+htmlcov/
+*.egg-info/
+
+# Build products
+build/
+dist/
+*.whl
+
+# Nix
+/result
+/result-*
+.direnv/
+
+# Local configuration and tool state
+.env
+.env.*
+.omp/
+
+# OS and editor files
+.DS_Store
+*.swp

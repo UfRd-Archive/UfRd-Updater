@@ -1,0 +1,436 @@
+# Example workflow for the UfRd-Archive repository.
+#
+# The reusable action checks out its own updater code, runs against the
+# committed updater.toml, and exposes this run's absolute release-plan path.
+#
+# Auto-commit/push happens inside the action at the end of its run when
+# [git].commit = true. That means the committed manifest can reference a
+# release the workflow has not published yet. For strict
+# publish-before-commit, set `commit: "false"` on the action, publish the
+# releases, then commit the four exports manually (or run the action again
+# after publication).
+#
+# If the action exits 1 (on_error = "fail"), successful entries are still
+# published and the job remains failed. A rollback/configuration failure
+# exposes no current release-plan output, so stale plans are never published.
+
+name: Update UfRd sources
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out archive repository
+        uses: actions/checkout@v4
+        with:
+          # Persisted credentials let the action push its own commit.
+          persist-credentials: true
+
+      - name: Update sources
+        id: ufrd
+        # Pin a release tag or commit SHA instead of @main in production.
+        uses: UfRd-Archive/UfRd-Updater@main
+        with:
+          config: updater.toml
+          # on_error: continue
+          # force: "true"
+          # prune: "true"
+          # commit: "false"
+          # push: "false"
+          # verbose: "true"
+
+      - name: Publish this run's releases
+        if: ${{ always() && steps.ufrd.outputs.releases != '' }}
+        env:
+          UFRD_RELEASES: ${{ steps.ufrd.outputs.releases }}
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_API_URL: ${{ github.api_url }}
+          # plan.run.repository wins over GITHUB_REPOSITORY. For a different
+          # repository, replace GH_TOKEN with a PAT/App token having contents:
+          # write on that target; github.token is scoped to this repository.
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib
+          import http.client
+          import json
+          import os
+          import re
+          import stat
+          import sys
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+          CHUNK_SIZE = 1024 * 1024
+          MAX_API_JSON = 16 * 1024 * 1024
+          TOKEN = ""
+          API_BASE = ""
+          API_ORIGIN = None
+
+
+          class PublishError(Exception):
+              pass
+
+
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, req, fp, code, msg, headers, newurl):
+                  # API writes must not be replayed; downloads follow manually.
+                  return None
+
+
+          OPENER = urllib.request.build_opener(NoRedirect())
+
+
+          def origin(url):
+              try:
+                  parts = urllib.parse.urlsplit(url)
+                  port = parts.port
+                  if (
+                      parts.scheme not in {"http", "https"} or not parts.hostname
+                      or parts.username is not None or parts.password is not None
+                      or parts.fragment
+                  ):
+                      raise ValueError
+                  return (
+                      parts.scheme, parts.hostname.lower(),
+                      port if port is not None else (443 if parts.scheme == "https" else 80),
+                  )
+              except (ValueError, TypeError):
+                  raise PublishError("API returned an invalid HTTP(S) URL.") from None
+
+
+          def open_http(method, url, *, label, data=None, headers=None, authenticated=True):
+              origin(url)
+              request_headers = {
+                  "Accept": "application/vnd.github+json",
+                  "Accept-Encoding": "identity",
+                  "User-Agent": "UfRd-Updater-publisher",
+                  "X-GitHub-Api-Version": "2022-11-28",
+              }
+              if authenticated:
+                  request_headers["Authorization"] = f"Bearer {TOKEN}"
+              request_headers.update(headers or {})
+              try:
+                  request = urllib.request.Request(
+                      url, data=data, headers=request_headers, method=method,
+                  )
+                  return OPENER.open(request, timeout=60)
+              except urllib.error.HTTPError as error:
+                  return error
+              except (OSError, http.client.HTTPException, ValueError):
+                  # Never print raw request errors, URLs, headers or API bodies.
+                  raise PublishError(f"Network/request failure while {label}.") from None
+
+
+          def require_status(status, expected, label):
+              if status in expected:
+                  return
+              if status == 401:
+                  detail = "authentication failed; check GH_TOKEN"
+              elif status == 403:
+                  detail = "forbidden/rate-limited; check target contents:write permission and API limits"
+              elif status in {409, 422}:
+                  detail = "conflict; the release may be immutable or an asset/tag may already exist"
+              elif status == 404:
+                  detail = "not found or inaccessible; check the target repository and token scope"
+              elif 300 <= status < 400:
+                  detail = "unexpected redirect; API writes are not redirected"
+              else:
+                  detail = "API request failed"
+              raise PublishError(f"HTTP {status} while {label}: {detail}. Nothing was overwritten.")
+
+
+          def api_json(method, url, *, label, payload=None, data=None, headers=None,
+                       expected=(200,), allow_not_found=False):
+              request_headers = dict(headers or {})
+              if payload is not None:
+                  data = json.dumps(payload, allow_nan=False).encode("utf-8")
+                  request_headers["Content-Type"] = "application/json"
+              with open_http(
+                  method, url, label=label, data=data, headers=request_headers,
+              ) as response:
+                  if allow_not_found and response.status == 404:
+                      return None, {}
+                  require_status(response.status, expected, label)
+                  try:
+                      raw = response.read(MAX_API_JSON + 1)
+                  except (OSError, http.client.HTTPException):
+                      raise PublishError(f"Network failure while {label}.") from None
+                  if len(raw) > MAX_API_JSON:
+                      raise PublishError(f"Oversized API metadata while {label}.")
+                  try:
+                      return json.loads(raw), response.headers
+                  except (ValueError, UnicodeError):
+                      raise PublishError(f"Invalid API JSON while {label}.") from None
+
+
+          def signature(info):
+              return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns
+
+
+          def inspect_asset(asset):
+              if not isinstance(asset, dict):
+                  raise PublishError("Invalid asset in release plan.")
+              for key in ("filename", "asset_name", "path", "sha256"):
+                  if not isinstance(asset.get(key), str) or not asset[key]:
+                      raise PublishError(f"Release asset requires a nonempty {key!r}.")
+              name = asset["asset_name"]
+              if (
+                  not re.fullmatch(r"[A-Za-z0-9._-]+", name) or len(name) > 200
+                  or name.startswith(".") or name.endswith(".")
+              ):
+                  raise PublishError(f"Invalid mapped GitHub asset name: {name!r}.")
+              if not os.path.isabs(asset["path"]):
+                  raise PublishError(f"Asset path must be absolute: {asset['path']!r}.")
+              if not re.fullmatch(r"[0-9a-fA-F]{64}", asset["sha256"]):
+                  raise PublishError(f"Invalid planned SHA256 for {name!r}.")
+              digest = hashlib.sha256()
+              try:
+                  with open(asset["path"], "rb") as handle:
+                      before = os.fstat(handle.fileno())
+                      if not stat.S_ISREG(before.st_mode):
+                          raise PublishError(f"Asset is not a regular file: {asset['path']!r}.")
+                      while chunk := handle.read(CHUNK_SIZE):
+                          digest.update(chunk)
+                      after = os.fstat(handle.fileno())
+              except OSError:
+                  raise PublishError(f"Cannot read local asset {asset['path']!r}.") from None
+              if signature(before) != signature(after):
+                  raise PublishError(f"Local asset changed while hashing: {asset['path']!r}.")
+              if digest.hexdigest() != asset["sha256"].lower():
+                  raise PublishError(f"Local SHA256 differs from the plan for {name!r}; refusing publication.")
+              return {
+                  **asset, "sha256": digest.hexdigest(),
+                  "size": after.st_size, "signature": signature(after),
+              }
+
+
+          def release_id(release):
+              value = release.get("id") if isinstance(release, dict) else None
+              if type(value) is not int or value <= 0:
+                  raise PublishError("API returned an invalid release ID.")
+              return value
+
+
+          def list_assets(repo_api, identifier, tag):
+              assets = {}
+              page = 1
+              while True:
+                  batch, headers = api_json(
+                      "GET", f"{repo_api}/releases/{identifier}/assets?per_page=100&page={page}",
+                      label=f"listing assets for {tag!r}",
+                  )
+                  if not isinstance(batch, list):
+                      raise PublishError("API returned an invalid release asset list.")
+                  for asset in batch:
+                      if not isinstance(asset, dict) or not isinstance(asset.get("name"), str):
+                          raise PublishError("API returned invalid release asset metadata.")
+                      if asset["name"] in assets:
+                          raise PublishError(f"Duplicate remote asset name {asset['name']!r}; refusing publication.")
+                      assets[asset["name"]] = asset
+                  if len(batch) < 100 and not re.search(r';\s*rel="?next\b', headers.get("Link", "")):
+                      return assets
+                  page += 1
+
+
+          def remote_sha256(repo_api, remote, local, tag):
+              digest = remote.get("digest")
+              match = re.fullmatch(r"sha256:([0-9a-f]{64})", digest, re.IGNORECASE) if isinstance(digest, str) else None
+              if match:
+                  return match[1].lower()
+              identifier = remote.get("id")
+              if type(identifier) is not int or identifier <= 0:
+                  raise PublishError("API returned an invalid asset ID for checksum verification.")
+              url = f"{repo_api}/releases/assets/{identifier}"
+              label = f"checking existing asset {local['asset_name']!r} on {tag!r}"
+              for redirect in range(11):
+                  current_origin = origin(url)
+                  with open_http(
+                      "GET", url, label=label,
+                      headers={"Accept": "application/octet-stream"},
+                      authenticated=current_origin == API_ORIGIN,
+                  ) as response:
+                      if response.status in {301, 302, 303, 307, 308}:
+                          location = response.headers.get("Location")
+                          if not location or redirect == 10:
+                              raise PublishError(f"Invalid/excessive download redirects while {label}.")
+                          next_url = urllib.parse.urljoin(url, location)
+                          if current_origin[0] == "https" and origin(next_url)[0] != "https":
+                              raise PublishError(f"Insecure download redirect while {label}.")
+                          url = next_url
+                          # Close redirect bodies unread. Tokens are sent only
+                          # to the configured API origin, never to object/CDN hosts.
+                          continue
+                      require_status(response.status, (200,), label)
+                      digest = hashlib.sha256()
+                      size = 0
+                      try:
+                          while chunk := response.read(CHUNK_SIZE):
+                              size += len(chunk)
+                              if size > local["size"]:
+                                  raise PublishError(f"Existing asset {local['asset_name']!r} differs in size; refusing to overwrite.")
+                              digest.update(chunk)
+                      except (OSError, http.client.HTTPException):
+                          raise PublishError(f"Network failure while {label}.") from None
+                      return digest.hexdigest()
+              raise PublishError(f"Too many download redirects while {label}.")
+
+
+          def upload_url(release, name):
+              template = release.get("upload_url")
+              if not isinstance(template, str) or not template:
+                  raise PublishError("API response lacks the release upload_url.")
+              url = template.split("{", 1)[0]
+              origin(url)
+              parts = urllib.parse.urlsplit(url)
+              query = [
+                  (key, value) for key, value in urllib.parse.parse_qsl(parts.query, keep_blank_values=True)
+                  if key not in {"name", "label"}
+              ]
+              query.append(("name", name))
+              return urllib.parse.urlunsplit(parts._replace(query=urllib.parse.urlencode(query)))
+
+
+          def main():
+              global TOKEN, API_BASE, API_ORIGIN
+              plan_path = os.environ.get("UFRD_RELEASES", "")
+              if not os.path.isabs(plan_path):
+                  raise PublishError("UFRD_RELEASES must be this run's absolute releases output path.")
+              try:
+                  with open(plan_path, encoding="utf-8") as handle:
+                      plan = json.load(handle)
+              except (OSError, ValueError, UnicodeError):
+                  raise PublishError("Cannot read this run's release plan.") from None
+              if not isinstance(plan, dict) or not isinstance(plan.get("releases"), list):
+                  raise PublishError("Invalid release plan.")
+              prepared = []
+              tags = set()
+              # Validate every local checksum before any API request or mutation.
+              for release in plan["releases"]:
+                  if not isinstance(release, dict) or not isinstance(release.get("tag"), str) or not release["tag"]:
+                      raise PublishError("Release plan contains an invalid tag.")
+                  tag = release["tag"]
+                  if tag in tags or not isinstance(release.get("assets"), list):
+                      raise PublishError(f"Duplicate tag or invalid assets for {tag!r}.")
+                  tags.add(tag)
+                  assets = [inspect_asset(asset) for asset in release["assets"]]
+                  if len({asset["asset_name"] for asset in assets}) != len(assets):
+                      raise PublishError(f"Duplicate mapped asset name for {tag!r}.")
+                  if assets:
+                      prepared.append({"tag": tag, "assets": assets})
+              if not prepared:
+                  print("No release assets in this run's plan.")
+                  return
+              run = plan.get("run")
+              if not isinstance(run, dict) or not isinstance(run.get("repository", ""), str):
+                  raise PublishError("Release plan has invalid run.repository.")
+              repository = run.get("repository") or os.environ.get("GITHUB_REPOSITORY", "")
+              if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository):
+                  raise PublishError("Set plan.run.repository or GITHUB_REPOSITORY to owner/repository.")
+              TOKEN = os.environ.get("GH_TOKEN", "")
+              if not TOKEN or not TOKEN.isascii() or "\r" in TOKEN or "\n" in TOKEN:
+                  raise PublishError("GH_TOKEN must contain a valid token for the target repository.")
+              API_BASE = os.environ.get("GITHUB_API_URL", "https://api.github.com").rstrip("/")
+              API_ORIGIN = origin(API_BASE)
+              if urllib.parse.urlsplit(API_BASE).query:
+                  raise PublishError("GITHUB_API_URL must not contain a query.")
+              repo_api = f"{API_BASE}/repos/" + "/".join(
+                  urllib.parse.quote(part, safe="") for part in repository.split("/")
+              )
+              print(f"Publishing plan for repository {repository!r}.")
+
+              # Preflight every existing release before creating/uploading anything.
+              # Only the tag endpoint's HTTP 404 means "release absent"; auth,
+              # rate-limit and network errors must never trigger creation.
+              for item in prepared:
+                  tag = item["tag"]
+                  existing, _ = api_json(
+                      "GET", f"{repo_api}/releases/tags/{urllib.parse.quote(tag, safe='')}",
+                      label=f"looking up release {tag!r}", allow_not_found=True,
+                  )
+                  item["existing"] = existing
+                  if existing is None:
+                      item["missing"] = item["assets"]
+                      continue
+                  remote_assets = list_assets(repo_api, release_id(existing), tag)
+                  missing = []
+                  for local in item["assets"]:
+                      remote = remote_assets.get(local["asset_name"])
+                      if remote is None:
+                          missing.append(local)
+                          continue
+                      if remote.get("state", "uploaded") != "uploaded":
+                          raise PublishError(f"Existing asset {local['asset_name']!r} is incomplete; refusing to replace it.")
+                      if remote_sha256(repo_api, remote, local, tag) != local["sha256"]:
+                          raise PublishError(f"Existing asset {local['asset_name']!r} on {tag!r} has a different SHA256; refusing to overwrite.")
+                      print(f"Reuse identical asset {local['asset_name']!r} on {tag!r}.")
+                  item["missing"] = missing
+                  if missing:
+                      if existing.get("immutable") is True:
+                          raise PublishError(f"Release {tag!r} is immutable and lacks planned assets; cannot append.")
+                      upload_url(existing, missing[0]["asset_name"])
+
+              for item in prepared:
+                  if not item["missing"]:
+                      continue
+                  tag = item["tag"]
+                  release = item["existing"]
+                  created = release is None
+                  if created:
+                      # Upload before publishing so immutable-release repositories
+                      # also work. A failed upload leaves a draft, never deleted.
+                      release, _ = api_json(
+                          "POST", f"{repo_api}/releases", label=f"creating draft release {tag!r}",
+                          payload={"tag_name": tag, "name": tag, "draft": True}, expected=(201,),
+                      )
+                  identifier = release_id(release)
+                  for asset in item["missing"]:
+                      label = f"uploading {asset['asset_name']!r} to {tag!r}"
+                      try:
+                          with open(asset["path"], "rb") as handle:
+                              if signature(os.fstat(handle.fileno())) != asset["signature"]:
+                                  raise PublishError(f"Local asset changed after hashing: {asset['path']!r}.")
+                              # urllib/http.client streams the file object with
+                              # explicit Content-Length; paths are never globbed
+                              # or parsed using gh's filename#label syntax.
+                              uploaded, _ = api_json(
+                                  "POST", upload_url(release, asset["asset_name"]),
+                                  label=label, data=handle, expected=(201,),
+                                  headers={
+                                      "Content-Type": "application/octet-stream",
+                                      "Content-Length": str(asset["size"]),
+                                  },
+                              )
+                      except OSError:
+                          raise PublishError(f"Cannot read local asset while {label}.") from None
+                      if not isinstance(uploaded, dict) or uploaded.get("name") != asset["asset_name"]:
+                          raise PublishError(f"API changed the uploaded asset name while {label}.")
+                      digest = uploaded.get("digest")
+                      if isinstance(digest, str) and digest.lower().startswith("sha256:"):
+                          if digest.lower() != f"sha256:{asset['sha256']}":
+                              raise PublishError(f"API reported a different uploaded SHA256 while {label}.")
+                      print(f"Uploaded {asset['asset_name']!r} to {tag!r}.")
+                  if created:
+                      api_json(
+                          "PATCH", f"{repo_api}/releases/{identifier}",
+                          label=f"publishing completed draft {tag!r}", payload={"draft": False},
+                      )
+                  # Existing releases, including drafts, retain their state.
+
+
+          try:
+              main()
+          except PublishError as error:
+              print(f"Release publication failed: {error}", file=sys.stderr)
+              raise SystemExit(1) from None
+          PY
